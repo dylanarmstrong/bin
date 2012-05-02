@@ -1,0 +1,34 @@
+#!/bin/bash
+
+die () {
+	echo >&2 "$@"
+	exit 1
+}
+
+[ "$#" -eq 2 ] || die "Usage: mkv2xbox input-file output-file"
+
+#[ -z $1 ] || die "File: $1 not found"
+
+echo "Input File: $1"
+echo "Output File: $2.avi"
+
+fps=`mkvinfo $1 | grep Default\ duration\: | awk '{print $6}' | cut -c 2-7`
+t1=`mkvinfo $1 | grep Track\ type\: | sed -e 1q | awk '{print $5}'`
+if test "$t1" = "video" 
+then
+  video="0"
+  audio="1"
+  fps=`echo $fps | awk '{print $1}'`
+elif test "$t1" = "audio"
+then
+  video="1"
+  audio="0"
+  fps=`echo $fps | awk '{print $2}'`
+fi
+
+mkvextract tracks $1 $video:video-$2.x264 $audio:audio-$2.ac3
+ffmpeg -i audio-$2.ac3 -acodec aac -ac 2 -strict -2 audio-$2.aac
+MP4Box -tmp . -add video-$2.x264 -fps $fps -add audio-$2.aac $2.avi
+rm audio-$2.ac3 video-$2.x264 audio-$2.aac
+
+echo "Done"
