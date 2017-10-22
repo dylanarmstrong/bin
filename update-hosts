@@ -1,0 +1,59 @@
+#!/bin/sh
+
+###                           ###
+# Update hosts from StevenBlack #
+###                           ###
+
+USER=admin
+ROUTER=192.168.1.1
+PORT=22
+FOLDER=$HOME/src/hosts
+
+cd $FOLDER
+
+# Running with sudo screws up the git checkout permissions
+if [ "`id -u`" -eq 0 ]; then
+  printf 'Please do not run as root.\n'
+  exit 1
+fi
+
+CMD=
+
+for i in "$@"; do
+  # This flag will have it update from git
+  if [[ $i == "--git" ]]; then
+    printf 'Checking out from git.\n'
+    git checkout -- hosts readmeData.json data &>/dev/null
+    git stash &>/dev/null
+    git pull &>/dev/null
+    git stash pop &>/dev/null
+
+  # Do not update different hosts
+  elif [[ $i == "--noupdate" ]]; then
+    CMD="--noupdate"
+
+  # Unrecognized, show help
+  else
+    printf 'Usage: update-hosts [--git] [--noupdate] [--help]\n--git\t\tUpdate hosts from git\n--noupdate\tDo not update\n--help\t\tShow this help\n'
+    exit 1
+  fi
+done
+
+# Update hosts file, replace the current one, and flush DNS
+printf 'Updating hosts file.\n'
+python updateHostsFile.py --auto -e fakenews adware malware --flush-dns-cache --replace $CMD &>/dev/null
+
+# This includes comments and blank lines
+printf 'Hosts file has %s lines.\n' `wc -l hosts | awk '{print $1}'`
+
+# Remove all non-host lines, copy to router, and restart dnsmasq
+printf 'Updating router.\n'
+gsed 's/^[#1-9a-z:].*$//g' hosts | gsed '/^$/d' | gsed '1d' | tee append hosts.router &>/dev/null
+scp -P $PORT hosts.router $USER@$ROUTER:/tmp/mnt/sda1/hosts &>/dev/null
+
+printf 'Restarting dnsmasq.\n'
+ssh -p $PORT $USER@$ROUTER service restart_dnsmasq &>/dev/null
+rm hosts.router &>/dev/null
+
+printf 'Done.\n';
+exit 0
