@@ -1,0 +1,32 @@
+#!/bin/bash
+# Backup a file / folder using xz
+# parameter 1 = file / folder
+# parameter 2 = destination
+if [ "$#" -eq 0 ]; then
+  printf "\e[1;34mUsage:\e[1;0m backup file destination\n"
+  exit 0
+fi
+FOLDER=$1
+# Date format is year, month, day, hour, minute with year in full format (ie 2016)
+DESTINATION=$2
+cd $FOLDER
+FILENAME=`pwd`.`date +%Y%m%d%H%M`.tar.xz
+# Don't break with your funky full path filenames..
+FILENAME=`echo $FILENAME | sed -e 's/\//\ /g' | awk '{print $NF}'`
+cd ../
+# If a destination isn't provided use the current directory
+if [[ -z "$DESTINATION" ]]; then
+  DESTINATION=.
+fi
+if [ ! -d $DESTINATION ]; then
+  printf "Destination \e[1;31m$DESTINATION\e[1;0m does not exist!\n"
+  exit 1
+fi
+printf "Backing up \e[1;34m$FOLDER\e[1;0m to \e[1;32m$DESTINATION/$FILENAME\e[1;0m\n"
+tar cJf $DESTINATION/$FILENAME $FOLDER 2>/dev/null
+if [ $? -eq 0 ]; then
+  exit 0
+fi
+# Don't care really how it failed, just that it failed is bad enough
+printf "\e[1;31mFailed!\e[1;0m\n"
+
