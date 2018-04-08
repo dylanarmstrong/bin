@@ -1,12 +1,12 @@
 #!/bin/sh
 
-###                           ###
+###---------------------------###
 # Update hosts from StevenBlack #
-###                           ###
+###---------------------------###
 
-USER=admin
+USER=meinhimmel
 ROUTER=192.168.1.1
-PORT=22
+PORT=667
 FOLDER=$HOME/src/hosts
 
 cd $FOLDER
@@ -41,7 +41,7 @@ done
 
 # Update hosts file, replace the current one, and flush DNS
 printf 'Updating hosts file.\n'
-python updateHostsFile.py --auto -e fakenews adware malware --flush-dns-cache --replace $CMD &>/dev/null
+python3 updateHostsFile.py --auto -e fakenews adware malware other --flush-dns-cache --replace $CMD &>/dev/null
 
 # This includes comments and blank lines
 printf 'Hosts file has %s lines.\n' `wc -l hosts | awk '{print $1}'`
@@ -57,3 +57,4 @@ rm hosts.router &>/dev/null
 
 printf 'Done.\n';
 exit 0
+
