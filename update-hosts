@@ -4,10 +4,16 @@
 # Update hosts from StevenBlack #
 ###---------------------------###
 
+# Check for gnused
+command -v gsed >/dev/null 2>&1 || { echo >&2 'gnu sed (gsed) is required'; exit 1; }
+
 USER=meinhimmel
 ROUTER=192.168.1.1
 PORT=667
 FOLDER=$HOME/src/hosts
+
+# Check folder exists
+[ ! -r $FOLDER ] && echo >&2 "Unable to find StevenBlack hosts at $FOLDER" && exit 1
 
 cd $FOLDER
 
