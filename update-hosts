@@ -53,7 +53,7 @@ scp -P $PORT hosts.router $USER@$ROUTER:/tmp/mnt/sda1/hosts &>/dev/null
 
 printf 'Restarting dnsmasq.\n'
 ssh -p $PORT $USER@$ROUTER service restart_dnsmasq &>/dev/null
-rm hosts.router &>/dev/null
+rm append hosts.router &>/dev/null
 
 printf 'Done.\n';
 exit 0
