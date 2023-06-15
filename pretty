@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+
+command -v prettier >/dev/null 2>&1 || { echo >&2 'Missing prettier'; exit 1; }
+
+prettier --single-quote --trailing-comma all --ignore-unknown --write "$@"
