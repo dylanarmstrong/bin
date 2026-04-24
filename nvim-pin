@@ -18,8 +18,6 @@ Environment:
   INIT_LUA        Override the init.lua path
   LAZY_LOCK_JSON  Override the lazy-lock.json path
   XDG_CONFIG_HOME Config root used for nvim files; defaults to ~/.config
-  XDG_CONFIG      Fallback alias if XDG_CONFIG_HOME is unset
-  XDG_CONFIG_DIR  Fallback alias if XDG_CONFIG_HOME and XDG_CONFIG are unset
   NVIM_PIN_COLOR  auto, always, or never; defaults to auto
 EOF
   exit "${1:-1}"
@@ -144,21 +142,15 @@ fetch_commit() {
   printf '%s\n' "$sha"
 }
 
-config_home_path() {
-  printf '%s\n' "${XDG_CONFIG_HOME:-${XDG_CONFIG:-${XDG_CONFIG_DIR:-${HOME}/.config}}}"
-}
-
 init_lua_path() {
-  local config_home
+  local config_home="${XDG_CONFIG_HOME:-${HOME}/.config}"
 
-  config_home="$(config_home_path)"
   printf '%s\n' "${INIT_LUA:-${config_home}/nvim/init.lua}"
 }
 
 lazy_lock_path() {
-  local config_home
+  local config_home="${XDG_CONFIG_HOME:-${HOME}/.config}"
 
-  config_home="$(config_home_path)"
   printf '%s\n' "${LAZY_LOCK_JSON:-${config_home}/nvim/lazy-lock.json}"
 }
 
@@ -243,6 +235,20 @@ sub default_lock_name {
   return $1;
 }
 
+sub skip_lua_long_bracket {
+  my ($text, $pos) = @_;
+
+  return undef unless substr($text, $pos, 1) eq '[';
+  return undef unless substr($text, $pos) =~ /\A\[(=*)\[/;
+
+  my $equals = $1;
+  my $close = ']' . $equals . ']';
+  my $body_pos = $pos + 2 + length($equals);
+  my $end = index($text, $close, $body_pos);
+
+  return $end < 0 ? length($text) : $end + length($close);
+}
+
 sub skip_lua_string {
   my ($text, $pos) = @_;
   my $quote = substr($text, $pos, 1);
@@ -265,6 +271,9 @@ sub skip_lua_string {
 
 sub skip_lua_comment {
   my ($text, $pos) = @_;
+  my $long_end = skip_lua_long_bracket($text, $pos + 2);
+  return $long_end if defined $long_end;
+
   my $end = index($text, "\n", $pos + 2);
 
   return $end < 0 ? length($text) : $end + 1;
@@ -285,6 +294,13 @@ sub extract_lua_table {
     }
 
     my $ch = substr($text, $pos, 1);
+    if ($ch eq '[') {
+      my $long_end = skip_lua_long_bracket($text, $pos);
+      if (defined $long_end) {
+        $pos = $long_end;
+        next;
+      }
+    }
     if ($ch eq "'" || $ch eq '"') {
       $pos = skip_lua_string($text, $pos);
       next;
@@ -315,6 +331,13 @@ sub find_top_level_name {
     }
 
     my $ch = substr($table, $pos, 1);
+    if ($ch eq '[') {
+      my $long_end = skip_lua_long_bracket($table, $pos);
+      if (defined $long_end) {
+        $pos = $long_end;
+        next;
+      }
+    }
     if ($ch eq "'" || $ch eq '"') {
       $pos = skip_lua_string($table, $pos);
       next;
@@ -343,6 +366,51 @@ sub find_top_level_name {
   return undef;
 }
 
+sub find_plugin_spec_tables {
+  my ($text, $repo) = @_;
+  my @tables;
+  my $len = length($text);
+  my $pos = 0;
+
+  while ($pos < $len) {
+    if (substr($text, $pos, 2) eq '--') {
+      $pos = skip_lua_comment($text, $pos);
+      next;
+    }
+
+    my $ch = substr($text, $pos, 1);
+    if ($ch eq '[') {
+      my $long_end = skip_lua_long_bracket($text, $pos);
+      if (defined $long_end) {
+        $pos = $long_end;
+        next;
+      }
+    }
+    if ($ch eq "'" || $ch eq '"') {
+      $pos = skip_lua_string($text, $pos);
+      next;
+    }
+
+    if ($ch eq '{') {
+      my $probe = $pos + 1;
+      $probe++ while $probe < $len && substr($text, $probe, 1) =~ /[ \t\r\n]/;
+
+      if (substr($text, $probe) =~ /\A(["'])\Q$repo\E\1/) {
+        my $table = extract_lua_table($text, $pos);
+        fail("could not parse lazy plugin spec for $repo") unless defined $table;
+
+        push @tables, $table;
+        $pos += length($table);
+        next;
+      }
+    }
+
+    $pos++;
+  }
+
+  return @tables;
+}
+
 sub explicit_lock_names {
   my ($text, @entries) = @_;
   my %names;
@@ -350,10 +418,7 @@ sub explicit_lock_names {
   for my $entry (@entries) {
     my $repo = $entry->{repo};
 
-    while ($text =~ /\{[ \t\r\n]*(["'])\Q$repo\E\1/g) {
-      my $table = extract_lua_table($text, $-[0]);
-      fail("could not parse lazy plugin spec for $repo") unless defined $table;
-
+    for my $table (find_plugin_spec_tables($text, $repo)) {
       my $name = find_top_level_name($table);
       next unless defined $name;
       validate_lock_name($name, $repo);
@@ -791,6 +856,7 @@ main() {
   if [[ ! "$days" =~ ^[0-9]+$ ]]; then
     die "days must be a non-negative integer: $days"
   fi
+  days=$((10#$days))
 
   repo="$(normalize_repo "$repo")"
 
