@@ -4,13 +4,21 @@ set -eEu -o pipefail
 
 usage() {
   cat <<EOF
-Usage: $(basename "${BASH_SOURCE[0]}") <repo> <days>
+Usage:
+  $(basename "${BASH_SOURCE[0]}")
+  $(basename "${BASH_SOURCE[0]}") <repo> <days>
 
-Update or add a pinned plugin commit in .config/nvim/init.lua.
+List, update, or add pinned plugin commits in init.lua.
 
 Arguments:
   repo   GitHub repo as owner/repo or https://github.com/owner/repo
   days   Non-negative integer; 0 selects the latest default-branch commit
+
+Environment:
+  INIT_LUA         Override the init.lua path
+  XDG_CONFIG_HOME  Config root used for nvim/init.lua; defaults to ~/.config
+  XDG_CONFIG_DIR   Fallback alias if XDG_CONFIG_HOME is unset
+  NVIM_PIN_JOBS    Parallel gh workers for listing; defaults to 8
 EOF
   exit "${1:-1}"
 }
@@ -54,6 +62,48 @@ days_ago_utc() {
   die "could not compute a UTC cutoff with this date implementation"
 }
 
+date_to_epoch() {
+  local date="$1"
+
+  if date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$date" '+%s' >/dev/null 2>&1; then
+    date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$date" '+%s'
+    return
+  fi
+
+  if date -u -d "$date" '+%s' >/dev/null 2>&1; then
+    date -u -d "$date" '+%s'
+    return
+  fi
+
+  return 1
+}
+
+age_days() {
+  local date="$1"
+  local epoch
+  local now
+  local diff
+  local days
+
+  epoch="$(date_to_epoch "$date")" || {
+    printf 'unknown'
+    return
+  }
+
+  now="$(date -u '+%s')"
+  diff=$((now - epoch))
+  if (( diff < 0 )); then
+    diff=0
+  fi
+
+  days=$((diff / 86400))
+  if (( days == 1 )); then
+    printf '1 day'
+  else
+    printf '%s days' "$days"
+  fi
+}
+
 fetch_commit() {
   local repo="$1"
   local days="$2"
@@ -75,6 +125,44 @@ fetch_commit() {
   printf '%s\n' "$sha"
 }
 
+fetch_commit_date() {
+  local repo="$1"
+  local commit="$2"
+  local date
+
+  if ! date="$(gh api --method GET "repos/${repo}/commits/${commit}" --jq '.commit.committer.date')"; then
+    die "failed to fetch commit ${commit} for ${repo} with gh api"
+  fi
+
+  if [[ ! "$date" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
+    die "gh api did not return a commit date for ${repo}@${commit}"
+  fi
+
+  printf '%s\n' "$date"
+}
+
+fetch_latest_commit() {
+  local repo="$1"
+  local latest
+
+  if ! latest="$(gh api --method GET "repos/${repo}/commits" -f per_page=1 --jq '.[0] | [.sha, .commit.committer.date] | @tsv')"; then
+    die "failed to fetch latest commit for ${repo} with gh api"
+  fi
+
+  if [[ ! "$latest" =~ ^[0-9a-f]{40}$'\t'[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
+    die "gh api did not return latest commit data for ${repo}"
+  fi
+
+  printf '%s\n' "$latest"
+}
+
+init_lua_path() {
+  local config_home
+
+  config_home="${XDG_CONFIG_HOME:-${XDG_CONFIG_DIR:-${HOME}/.config}}"
+  printf '%s\n' "${INIT_LUA:-${config_home}/nvim/init.lua}"
+}
+
 current_commit() {
   local repo="$1"
   local init_lua="$2"
@@ -84,6 +172,19 @@ current_commit() {
       print "$1\n";
       exit;
     }
+  ' "$init_lua"
+}
+
+list_commits() {
+  local init_lua="$1"
+
+  perl -ne '
+    $in_table = 1 if /^local\s+plugin_commits\s*=\s*\{/;
+    next unless $in_table;
+    if (/^\s*\[\x27([^\x27]+)\x27\]\s*=\s*\x27([0-9a-f]{40})\x27,\s*$/) {
+      print "$1\t$2\n";
+    }
+    exit if /^\}/;
   ' "$init_lua"
 }
 
@@ -131,32 +232,122 @@ upsert_commit() {
   ' "$init_lua"
 }
 
+list_status_row() {
+  local repo="$1"
+  local commit="$2"
+  local commit_date
+  local commit_age
+  local latest
+  local latest_commit
+  local latest_date
+  local latest_age
+  local commit_epoch
+  local latest_epoch
+  local available
+
+  commit_date="$(fetch_commit_date "$repo" "$commit")"
+  commit_age="$(age_days "$commit_date")"
+  latest="$(fetch_latest_commit "$repo")"
+  latest_commit="${latest%%$'\t'*}"
+  latest_date="${latest#*$'\t'}"
+  latest_age="$(age_days "$latest_date")"
+  available='no'
+
+  commit_epoch="$(date_to_epoch "$commit_date")"
+  latest_epoch="$(date_to_epoch "$latest_date")"
+  if [[ "$latest_commit" != "$commit" && "$latest_epoch" -gt "$commit_epoch" ]]; then
+    available="yes ${latest_commit} (${latest_age})"
+  fi
+
+  printf '%-42s %-40s %-9s %s\n' "$repo" "$commit" "$commit_age" "$available"
+}
+
+wait_for_status_slot() {
+  local max_jobs="$1"
+  local running
+
+  while true; do
+    running="$(jobs -pr | wc -l | tr -d ' ')"
+    if (( running < max_jobs )); then
+      return
+    fi
+    sleep 0.1
+  done
+}
+
+list_status() {
+  local init_lua="$1"
+  local max_jobs="${NVIM_PIN_JOBS:-8}"
+  local tmpdir
+  local repo
+  local commit
+  local count=0
+  local failed=0
+  local pid
+  local i
+  local pids=()
+
+  if [[ ! "$max_jobs" =~ ^[1-9][0-9]*$ ]]; then
+    die "NVIM_PIN_JOBS must be a positive integer: $max_jobs"
+  fi
+
+  tmpdir="$(mktemp -d)"
+  printf '%-42s %-40s %-9s %s\n' 'repo' 'commit' 'age' 'newer'
+  while IFS=$'\t' read -r repo commit; do
+    wait_for_status_slot "$max_jobs"
+    count=$((count + 1))
+    list_status_row "$repo" "$commit" > "${tmpdir}/${count}" &
+    pids+=("$!")
+  done < <(list_commits "$init_lua")
+
+  for pid in "${pids[@]}"; do
+    if ! wait "$pid"; then
+      failed=1
+    fi
+  done
+
+  for ((i = 1; i <= count; i++)); do
+    cat "${tmpdir}/${i}"
+  done
+  rm -rf "$tmpdir"
+
+  if (( failed != 0 )); then
+    die "failed to fetch one or more plugin statuses"
+  fi
+}
+
 main() {
   if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
     usage 0
   fi
 
-  if [[ $# -ne 2 ]]; then
+  if [[ $# -ne 0 && $# -ne 2 ]]; then
     usage 2
   fi
 
-  local repo="$1"
-  local days="$2"
-  local script_dir
+  local repo
+  local days
   local init_lua
   local old_commit
   local new_commit
+
+  init_lua="$(init_lua_path)"
+  [[ -f "$init_lua" ]] || die "init.lua not found: $init_lua"
+  command -v gh >/dev/null 2>&1 || die "gh CLI is required"
+
+  if [[ $# -eq 0 ]]; then
+    list_status "$init_lua"
+    return
+  fi
+
+  repo="$1"
+  days="$2"
 
   if [[ ! "$days" =~ ^[0-9]+$ ]]; then
     die "days must be a non-negative integer: $days"
   fi
 
   repo="$(normalize_repo "$repo")"
-  script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-  init_lua="${INIT_LUA:-${script_dir}/.config/nvim/init.lua}"
-
-  [[ -f "$init_lua" ]] || die "init.lua not found: $init_lua"
-  command -v gh >/dev/null 2>&1 || die "gh CLI is required"
 
   old_commit="$(current_commit "$repo" "$init_lua")"
   new_commit="$(fetch_commit "$repo" "$days")"
