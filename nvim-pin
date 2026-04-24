@@ -11,7 +11,7 @@ Usage:
 List, update, or add pinned plugin commits in init.lua.
 
 Arguments:
-  repo   GitHub repo as owner/repo or https://github.com/owner/repo
+  repo   GitHub repo as owner/repo or https://github.com/owner/repo; use all to update every pin
   days   Non-negative integer; 0 selects the latest default-branch commit
 
 Environment:
@@ -567,6 +567,18 @@ if ($mode eq 'list') {
   exit 0;
 }
 
+if ($mode eq 'pins') {
+  @args == 1 or fail('internal error: pins expects init_lua');
+  my ($path) = @args;
+
+  my $table = find_table(read_file($path));
+  my @entries = parse_entries($table);
+  for my $entry (@entries) {
+    print join("\t", $entry->{repo}, $entry->{commit}), "\n";
+  }
+  exit 0;
+}
+
 if ($mode eq 'upsert') {
   @args == 3 or fail('internal error: upsert expects init_lua, repo, commit');
   my ($path, $repo, $commit) = @args;
@@ -602,6 +614,45 @@ if ($mode eq 'upsert') {
   exit 0;
 }
 
+if ($mode eq 'update-many') {
+  @args >= 1 && @args % 2 == 1
+    or fail('internal error: update-many expects init_lua followed by repo commit pairs');
+  my ($path, @updates) = @args;
+  my %updates;
+
+  while (@updates) {
+    my $repo = shift @updates;
+    my $commit = shift @updates;
+
+    validate_repo($repo) or fail("invalid repo: $repo");
+    validate_commit($commit) or fail("invalid commit for $repo: $commit");
+    fail("duplicate update for $repo") if exists $updates{$repo};
+
+    $updates{$repo} = $commit;
+  }
+
+  my $text = read_file($path);
+  my $table = find_table($text);
+  my @entries = parse_entries($table);
+
+  for my $entry (@entries) {
+    next unless exists $updates{$entry->{repo}};
+    update_entry($entry, $updates{$entry->{repo}});
+    delete $updates{$entry->{repo}};
+  }
+
+  if (%updates) {
+    fail("cannot update unpinned repos: " . join(", ", sort keys %updates));
+  }
+
+  @entries = sort_entries(@entries);
+  my @lines = map { $_->{line} } @entries;
+  my $body = @lines ? join("\n", @lines) . "\n" : '';
+  my $updated = $table->{prefix} . $table->{start} . $body . $table->{end} . $table->{suffix};
+  write_file($path, $updated);
+  exit 0;
+}
+
 fail("internal error: unknown plugin_commits mode: $mode");
 PERL
 }
@@ -620,12 +671,66 @@ list_commits() {
   plugin_commits list "$init_lua" "$lazy_lock"
 }
 
+pinned_commits() {
+  local init_lua="$1"
+
+  plugin_commits pins "$init_lua"
+}
+
 upsert_commit() {
   local repo="$1"
   local commit="$2"
   local init_lua="$3"
 
   plugin_commits upsert "$init_lua" "$repo" "$commit"
+}
+
+update_many_commits() {
+  local init_lua="$1"
+  shift
+
+  plugin_commits update-many "$init_lua" "$@"
+}
+
+update_all_commits() {
+  local init_lua="$1"
+  local days="$2"
+  local pins
+  local rows=''
+  local repo
+  local old_commit
+  local new_commit
+  local updated_count=0
+  local unchanged_count=0
+  local updates=()
+
+  pins="$(pinned_commits "$init_lua")"
+  if [[ -z "$pins" ]]; then
+    printf 'no pinned plugins found\n'
+    return
+  fi
+
+  while IFS=$'\t' read -r repo old_commit; do
+    new_commit="$(fetch_commit "$repo" "$days")"
+    rows+="${repo}"$'\t'"${old_commit}"$'\t'"${new_commit}"$'\n'
+    updates+=("$repo" "$new_commit")
+  done <<< "$pins"
+
+  update_many_commits "$init_lua" "${updates[@]}"
+
+  while IFS=$'\t' read -r repo old_commit new_commit; do
+    [[ -n "$repo" ]] || continue
+
+    if [[ "$old_commit" == "$new_commit" ]]; then
+      unchanged_count=$((unchanged_count + 1))
+      printf '%s already pinned to %s\n' "$repo" "$new_commit"
+    else
+      updated_count=$((updated_count + 1))
+      printf 'Updated %s: %s -> %s\n' "$repo" "$old_commit" "$new_commit"
+    fi
+  done <<< "$rows"
+
+  printf 'Updated %s pins; %s unchanged\n' "$updated_count" "$unchanged_count"
 }
 
 fetch_status_rows() {
@@ -857,6 +962,11 @@ main() {
     die "days must be a non-negative integer: $days"
   fi
   days=$((10#$days))
+
+  if [[ "$repo" == "all" ]]; then
+    update_all_commits "$init_lua" "$days"
+    return
+  fi
 
   repo="$(normalize_repo "$repo")"
 
