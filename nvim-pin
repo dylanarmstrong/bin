@@ -1,0 +1,174 @@
+#!/usr/bin/env bash
+
+set -eEu -o pipefail
+
+usage() {
+  cat <<EOF
+Usage: $(basename "${BASH_SOURCE[0]}") <repo> <days>
+
+Update or add a pinned plugin commit in .config/nvim/init.lua.
+
+Arguments:
+  repo   GitHub repo as owner/repo or https://github.com/owner/repo
+  days   Non-negative integer; 0 selects the latest default-branch commit
+EOF
+  exit "${1:-1}"
+}
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+normalize_repo() {
+  local repo="$1"
+
+  repo="${repo%%\?*}"
+  repo="${repo%%#*}"
+  repo="${repo#https://github.com/}"
+  repo="${repo#http://github.com/}"
+  repo="${repo#github.com/}"
+  repo="${repo%/}"
+  repo="${repo%.git}"
+
+  if [[ ! "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+    die "repo must be owner/repo or https://github.com/owner/repo: $1"
+  fi
+
+  printf '%s\n' "$repo"
+}
+
+days_ago_utc() {
+  local days="$1"
+
+  if date -u -v-"${days}"d '+%Y-%m-%dT%H:%M:%SZ' >/dev/null 2>&1; then
+    date -u -v-"${days}"d '+%Y-%m-%dT%H:%M:%SZ'
+    return
+  fi
+
+  if date -u -d "${days} days ago" '+%Y-%m-%dT%H:%M:%SZ' >/dev/null 2>&1; then
+    date -u -d "${days} days ago" '+%Y-%m-%dT%H:%M:%SZ'
+    return
+  fi
+
+  die "could not compute a UTC cutoff with this date implementation"
+}
+
+fetch_commit() {
+  local repo="$1"
+  local days="$2"
+  local args=(--method GET "repos/${repo}/commits" -f per_page=1)
+  local sha
+
+  if (( days > 0 )); then
+    args+=(-f "until=$(days_ago_utc "$days")")
+  fi
+
+  if ! sha="$(gh api "${args[@]}" --jq '.[0].sha')"; then
+    die "failed to fetch commits for ${repo} with gh api"
+  fi
+
+  if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+    die "gh api did not return a commit SHA for ${repo}"
+  fi
+
+  printf '%s\n' "$sha"
+}
+
+current_commit() {
+  local repo="$1"
+  local init_lua="$2"
+
+  REPO="$repo" perl -ne '
+    if (/\[\x27\Q$ENV{REPO}\E\x27\]\s*=\s*\x27([0-9a-f]{40})\x27/) {
+      print "$1\n";
+      exit;
+    }
+  ' "$init_lua"
+}
+
+upsert_commit() {
+  local repo="$1"
+  local commit="$2"
+  local init_lua="$3"
+
+  REPO="$repo" COMMIT="$commit" perl -0pi -e '
+    my $repo = $ENV{REPO};
+    my $commit = $ENV{COMMIT};
+    my $entry = "  [\x27$repo\x27] = \x27$commit\x27,";
+
+    s{
+      (local\s+plugin_commits\s*=\s*\{\n)
+      (.*?)
+      (\n\})
+    }{
+      my ($start, $body, $end) = ($1, $2, $3);
+      my @entries;
+      my @other;
+      my $found = 0;
+
+      for my $line (split /\n/, $body) {
+        if ($line =~ /^\s*\[\x27([^\x27]+)\x27\]\s*=\s*\x27[0-9a-f]{40}\x27,\s*$/) {
+          if ($1 eq $repo) {
+            $line = $entry;
+            $found = 1;
+          }
+          push @entries, $line;
+        } elsif ($line =~ /\S/) {
+          push @other, $line;
+        }
+      }
+
+      push @entries, $entry unless $found;
+      @entries = sort {
+        my ($a_repo) = $a =~ /\[\x27([^\x27]+)\x27\]/;
+        my ($b_repo) = $b =~ /\[\x27([^\x27]+)\x27\]/;
+        lc($a_repo) cmp lc($b_repo);
+      } @entries;
+
+      $start . join("\n", @entries, @other) . $end;
+    }sex or die "plugin_commits table not found\n";
+  ' "$init_lua"
+}
+
+main() {
+  if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    usage 0
+  fi
+
+  if [[ $# -ne 2 ]]; then
+    usage 2
+  fi
+
+  local repo="$1"
+  local days="$2"
+  local script_dir
+  local init_lua
+  local old_commit
+  local new_commit
+
+  if [[ ! "$days" =~ ^[0-9]+$ ]]; then
+    die "days must be a non-negative integer: $days"
+  fi
+
+  repo="$(normalize_repo "$repo")"
+  script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+  init_lua="${INIT_LUA:-${script_dir}/.config/nvim/init.lua}"
+
+  [[ -f "$init_lua" ]] || die "init.lua not found: $init_lua"
+  command -v gh >/dev/null 2>&1 || die "gh CLI is required"
+
+  old_commit="$(current_commit "$repo" "$init_lua")"
+  new_commit="$(fetch_commit "$repo" "$days")"
+  upsert_commit "$repo" "$new_commit" "$init_lua"
+
+  if [[ -z "$old_commit" ]]; then
+    printf 'Added %s: %s\n' "$repo" "$new_commit"
+  elif [[ "$old_commit" == "$new_commit" ]]; then
+    printf '%s already pinned to %s\n' "$repo" "$new_commit"
+  else
+    printf 'Updated %s: %s -> %s\n' "$repo" "$old_commit" "$new_commit"
+  fi
+}
+
+main "$@"
