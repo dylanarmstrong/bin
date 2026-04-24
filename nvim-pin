@@ -15,9 +15,12 @@ Arguments:
   days   Non-negative integer; 0 selects the latest default-branch commit
 
 Environment:
-  INIT_LUA         Override the init.lua path
-  XDG_CONFIG_HOME  Config root used for nvim/init.lua; defaults to ~/.config
-  XDG_CONFIG_DIR   Fallback alias if XDG_CONFIG_HOME is unset
+  INIT_LUA        Override the init.lua path
+  LAZY_LOCK_JSON  Override the lazy-lock.json path
+  XDG_CONFIG_HOME Config root used for nvim files; defaults to ~/.config
+  XDG_CONFIG      Fallback alias if XDG_CONFIG_HOME is unset
+  XDG_CONFIG_DIR  Fallback alias if XDG_CONFIG_HOME and XDG_CONFIG are unset
+  NVIM_PIN_COLOR  auto, always, or never; defaults to auto
 EOF
   exit "${1:-1}"
 }
@@ -103,6 +106,23 @@ age_days() {
   fi
 }
 
+color_enabled() {
+  case "${NVIM_PIN_COLOR:-auto}" in
+    always)
+      return 0
+      ;;
+    auto)
+      [[ -t 1 && -z "${NO_COLOR:-}" ]]
+      ;;
+    never)
+      return 1
+      ;;
+    *)
+      die "NVIM_PIN_COLOR must be auto, always, or never: ${NVIM_PIN_COLOR}"
+      ;;
+  esac
+}
+
 fetch_commit() {
   local repo="$1"
   local days="$2"
@@ -124,11 +144,22 @@ fetch_commit() {
   printf '%s\n' "$sha"
 }
 
+config_home_path() {
+  printf '%s\n' "${XDG_CONFIG_HOME:-${XDG_CONFIG:-${XDG_CONFIG_DIR:-${HOME}/.config}}}"
+}
+
 init_lua_path() {
   local config_home
 
-  config_home="${XDG_CONFIG_HOME:-${XDG_CONFIG_DIR:-${HOME}/.config}}"
+  config_home="$(config_home_path)"
   printf '%s\n' "${INIT_LUA:-${config_home}/nvim/init.lua}"
+}
+
+lazy_lock_path() {
+  local config_home
+
+  config_home="$(config_home_path)"
+  printf '%s\n' "${LAZY_LOCK_JSON:-${config_home}/nvim/lazy-lock.json}"
 }
 
 plugin_commits() {
@@ -140,6 +171,7 @@ use strict;
 use warnings;
 use File::Basename qw(dirname);
 use File::Temp qw(tempfile);
+use JSON::PP qw(decode_json);
 
 my ($mode, @args) = @ARGV;
 
@@ -196,6 +228,166 @@ sub validate_repo {
 sub validate_commit {
   my ($commit) = @_;
   return $commit =~ /\A[0-9a-f]{40}\z/;
+}
+
+sub validate_lock_name {
+  my ($name, $context) = @_;
+  fail("$context has an invalid lazy-lock name")
+    if !defined($name) || $name eq '' || $name =~ /[\t\r\n]/;
+}
+
+sub default_lock_name {
+  my ($repo) = @_;
+
+  $repo =~ m{/([^/]+)\z} or fail("invalid repo: $repo");
+  return $1;
+}
+
+sub skip_lua_string {
+  my ($text, $pos) = @_;
+  my $quote = substr($text, $pos, 1);
+  my $len = length($text);
+
+  $pos++;
+  while ($pos < $len) {
+    my $ch = substr($text, $pos, 1);
+    if ($ch eq "\\") {
+      $pos += 2;
+      next;
+    }
+
+    $pos++;
+    last if $ch eq $quote;
+  }
+
+  return $pos;
+}
+
+sub skip_lua_comment {
+  my ($text, $pos) = @_;
+  my $end = index($text, "\n", $pos + 2);
+
+  return $end < 0 ? length($text) : $end + 1;
+}
+
+sub extract_lua_table {
+  my ($text, $open_pos) = @_;
+  my $len = length($text);
+  my $depth = 0;
+  my $pos = $open_pos;
+
+  return undef unless substr($text, $open_pos, 1) eq '{';
+
+  while ($pos < $len) {
+    if (substr($text, $pos, 2) eq '--') {
+      $pos = skip_lua_comment($text, $pos);
+      next;
+    }
+
+    my $ch = substr($text, $pos, 1);
+    if ($ch eq "'" || $ch eq '"') {
+      $pos = skip_lua_string($text, $pos);
+      next;
+    }
+    if ($ch eq '{') {
+      $depth++;
+    } elsif ($ch eq '}') {
+      $depth--;
+      return substr($text, $open_pos, $pos - $open_pos + 1) if $depth == 0;
+    }
+
+    $pos++;
+  }
+
+  return undef;
+}
+
+sub find_top_level_name {
+  my ($table) = @_;
+  my $len = length($table);
+  my $depth = 0;
+  my $pos = 0;
+
+  while ($pos < $len) {
+    if (substr($table, $pos, 2) eq '--') {
+      $pos = skip_lua_comment($table, $pos);
+      next;
+    }
+
+    my $ch = substr($table, $pos, 1);
+    if ($ch eq "'" || $ch eq '"') {
+      $pos = skip_lua_string($table, $pos);
+      next;
+    }
+    if ($ch eq '{') {
+      $depth++;
+      $pos++;
+      next;
+    }
+    if ($ch eq '}') {
+      $depth--;
+      $pos++;
+      next;
+    }
+
+    if ($depth == 1) {
+      my $prev = $pos == 0 ? '' : substr($table, $pos - 1, 1);
+      if ($prev !~ /[A-Za-z0-9_]/ && substr($table, $pos) =~ /\Aname[ \t\r\n]*=[ \t\r\n]*(["'])([^\t\r\n"']+)\1/) {
+        return $2;
+      }
+    }
+
+    $pos++;
+  }
+
+  return undef;
+}
+
+sub explicit_lock_names {
+  my ($text, @entries) = @_;
+  my %names;
+
+  for my $entry (@entries) {
+    my $repo = $entry->{repo};
+
+    while ($text =~ /\{[ \t\r\n]*(["'])\Q$repo\E\1/g) {
+      my $table = extract_lua_table($text, $-[0]);
+      fail("could not parse lazy plugin spec for $repo") unless defined $table;
+
+      my $name = find_top_level_name($table);
+      next unless defined $name;
+      validate_lock_name($name, $repo);
+
+      if (exists($names{$repo}) && $names{$repo} ne $name) {
+        fail("conflicting lazy plugin names for $repo: $names{$repo}, $name");
+      }
+
+      $names{$repo} = $name;
+    }
+  }
+
+  return \%names;
+}
+
+sub read_lock_commits {
+  my ($path) = @_;
+  my $decoded = eval { decode_json(read_file($path)) };
+  my %locks;
+
+  fail("$path is not valid JSON") if $@ || ref($decoded) ne 'HASH';
+
+  for my $name (keys %{$decoded}) {
+    validate_lock_name($name, "lazy-lock entry");
+
+    my $entry = $decoded->{$name};
+    fail("$path entry $name is not an object") unless ref($entry) eq 'HASH';
+    fail("$path entry $name has an invalid commit")
+      unless validate_commit($entry->{commit} // '');
+
+    $locks{$name} = $entry->{commit};
+  }
+
+  return \%locks;
 }
 
 sub find_table {
@@ -293,13 +485,19 @@ if ($mode eq 'current') {
 }
 
 if ($mode eq 'list') {
-  @args == 1 or fail('internal error: list expects init_lua');
-  my ($path) = @args;
+  @args == 2 or fail('internal error: list expects init_lua and lazy_lock');
+  my ($path, $lock_path) = @args;
 
-  my $table = find_table(read_file($path));
+  my $text = read_file($path);
+  my $table = find_table($text);
   my @entries = parse_entries($table);
+  my $names = explicit_lock_names($text, @entries);
+  my $locks = read_lock_commits($lock_path);
+
   for my $entry (@entries) {
-    print "$entry->{repo}\t$entry->{commit}\n";
+    my $lock_name = $names->{$entry->{repo}} // default_lock_name($entry->{repo});
+    my $lock_commit = $locks->{$lock_name} // '';
+    print join("\t", $entry->{repo}, $entry->{commit}, $lock_name, $lock_commit), "\n";
   }
   exit 0;
 }
@@ -352,8 +550,9 @@ current_commit() {
 
 list_commits() {
   local init_lua="$1"
+  local lazy_lock="$2"
 
-  plugin_commits list "$init_lua"
+  plugin_commits list "$init_lua" "$lazy_lock"
 }
 
 upsert_commit() {
@@ -372,13 +571,15 @@ fetch_status_rows() {
   local response
   local repo
   local commit
+  local _lock_name
+  local _lock_commit
   local owner
   local name
   local separator=''
   local index=0
   local args=()
 
-  while IFS=$'\t' read -r repo commit; do
+  while IFS=$'\t' read -r repo commit _lock_name _lock_commit; do
     owner="${repo%%/*}"
     name="${repo#*/}"
 
@@ -445,9 +646,13 @@ fetch_status_rows() {
 
     my @pins = grep { length } split /\n/, $ENV{STATUS_COMMITS} // "";
     for my $index (0 .. $#pins) {
-      my ($repo, $commit) = split /\t/, $pins[$index], 2;
+      my ($repo, $commit, $lock_name, $lock_commit) = split /\t/, $pins[$index], 4;
       fail("internal error: malformed status input at row " . ($index + 1))
-        unless defined $repo && defined $commit && valid_sha($commit);
+        unless defined $repo && defined $commit && defined $lock_name && defined $lock_commit
+          && valid_sha($commit)
+          && $lock_name ne ""
+          && $lock_name !~ /[\t\r\n]/
+          && ($lock_commit eq "" || valid_sha($lock_commit));
 
       my $repo_data = $data->{"r$index"};
       fail("$repo: repository not found") unless ref($repo_data) eq "HASH";
@@ -473,23 +678,63 @@ fetch_status_rows() {
       fail("$repo: default branch returned invalid commit date")
         unless valid_date($latest->{committedDate});
 
-      print join("\t", $repo, $commit, $pinned->{committedDate}, $latest->{oid}), "\n";
+      print join("\t", $repo, $commit, $pinned->{committedDate}, $latest->{oid}, $lock_name, $lock_commit), "\n";
     }
   ' <<< "$response"
 }
 
+print_status_row() {
+  local repo="$1"
+  local commit="$2"
+  local commit_age="$3"
+  local available="$4"
+  local lock_mismatch="$5"
+  local use_color="$6"
+  local repo_col
+  local commit_col
+  local age_col
+  local available_col
+
+  printf -v repo_col '%-42s' "$repo"
+  printf -v commit_col '%-40s' "$commit"
+  printf -v age_col '%-9s' "$commit_age"
+  available_col="$available"
+
+  if (( use_color != 0 && lock_mismatch != 0 )); then
+    repo_col=$'\033[31m'"${repo_col}"$'\033[0m'
+    commit_col=$'\033[31m'"${commit_col}"$'\033[0m'
+    age_col=$'\033[31m'"${age_col}"$'\033[0m'
+    available_col=$'\033[31m'"${available_col}"$'\033[0m'
+  fi
+
+  if [[ "$available" == "yes" && "$use_color" -ne 0 ]]; then
+    available_col=$'\033[32m'"${available}"$'\033[0m'
+  fi
+
+  printf '%s %s %s %s\n' "$repo_col" "$commit_col" "$age_col" "$available_col"
+}
+
 list_status() {
   local init_lua="$1"
+  local lazy_lock="$2"
   local repo
   local commit
   local commit_date
   local commit_age
   local latest_commit
+  local _lock_name
+  local lock_commit
+  local lock_mismatch
   local available
   local commits
   local rows
+  local use_color=0
 
-  commits="$(list_commits "$init_lua")"
+  if color_enabled; then
+    use_color=1
+  fi
+
+  commits="$(list_commits "$init_lua" "$lazy_lock")"
   if [[ -z "$commits" ]]; then
     printf 'no pinned plugins found\n'
     return
@@ -499,13 +744,17 @@ list_status() {
   [[ -n "$rows" ]] || die "gh api graphql did not return any plugin statuses"
 
   printf '%-42s %-40s %-9s %s\n' 'repo' 'commit' 'age' 'newer'
-  while IFS=$'\t' read -r repo commit commit_date latest_commit; do
+  while IFS=$'\t' read -r repo commit commit_date latest_commit _lock_name lock_commit; do
     commit_age="$(age_days "$commit_date")"
     available='no'
     if [[ "$latest_commit" != "$commit" ]]; then
       available='yes'
     fi
-    printf '%-42s %-40s %-9s %s\n' "$repo" "$commit" "$commit_age" "$available"
+    lock_mismatch=0
+    if [[ "$lock_commit" != "$commit" ]]; then
+      lock_mismatch=1
+    fi
+    print_status_row "$repo" "$commit" "$commit_age" "$available" "$lock_mismatch" "$use_color"
   done <<< "$rows"
 }
 
@@ -521,6 +770,7 @@ main() {
   local repo
   local days
   local init_lua
+  local lazy_lock
   local old_commit
   local new_commit
 
@@ -529,7 +779,9 @@ main() {
   command -v gh >/dev/null 2>&1 || die "gh CLI is required"
 
   if [[ $# -eq 0 ]]; then
-    list_status "$init_lua"
+    lazy_lock="$(lazy_lock_path)"
+    [[ -f "$lazy_lock" ]] || die "lazy-lock.json not found: $lazy_lock"
+    list_status "$init_lua" "$lazy_lock"
     return
   fi
 
